@@ -9,12 +9,19 @@
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["myapi", "mcp", "model-context-protocol", "ed25519", "asc", "ai-agent"],
+  "keywords": [
+    "myapi",
+    "mcp",
+    "model-context-protocol",
+    "ed25519",
+    "asc",
+    "ai-agent"
+  ],
   "author": "omribenami",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/omribenami/myapi-asc-mcp.git"
+    "url": "git+https://github.com/omribenami/myapi-asc-mcp.git"
   },
   "homepage": "https://github.com/omribenami/myapi-asc-mcp#readme",
   "dependencies": {
