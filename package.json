@@ -1,0 +1,23 @@
+{
+  "name": "myapi-asc-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for MyApi — handles Ed25519 keypair generation, registration, and per-request signing automatically.",
+  "main": "index.js",
+  "bin": {
+    "myapi-asc-mcp": "index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["myapi", "mcp", "model-context-protocol", "ed25519", "asc", "ai-agent"],
+  "author": "omribenami",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/omribenami/myapi-asc-mcp.git"
+  },
+  "homepage": "https://github.com/omribenami/myapi-asc-mcp#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}
