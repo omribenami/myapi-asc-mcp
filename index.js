@@ -12,9 +12,7 @@ const os     = require('os');
 // ── Config ───────────────────────────────────────────────────────────────────
 
 const BASE_URL = (process.env.MYAPI_BASE_URL || 'https://www.myapiai.com').replace(/\/$/, '');
-const BEARER   = process.env.MYAPI_TOKEN || '';
 const KEY_FILE = path.join(os.homedir(), '.myapi', 'asc-mcp.json');
-const LABEL    = `myapi-asc-mcp (${os.hostname()})`;
 
 // ── Key management ───────────────────────────────────────────────────────────
 
@@ -24,10 +22,12 @@ function loadKey() {
 
 function generateAndSaveKey() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
-  const rawPub  = publicKey.export({ format: 'der', type: 'spki' }).subarray(12).toString('base64');
-  const privPem = privateKey.export({ format: 'pem', type: 'pkcs8' });
+  const rawPub    = publicKey.export({ format: 'der', type: 'spki' }).subarray(12);
+  const rawPubB64 = rawPub.toString('base64');
+  const privPem   = privateKey.export({ format: 'pem', type: 'pkcs8' });
+  const fingerprint = crypto.createHash('sha256').update(rawPubB64).digest('hex').substring(0, 32);
   fs.mkdirSync(path.dirname(KEY_FILE), { recursive: true });
-  const keyData = { publicKey: rawPub, privateKey: privPem, tokenId: null, approved: false };
+  const keyData = { publicKey: rawPubB64, privateKey: privPem, fingerprint, approved: false };
   fs.writeFileSync(KEY_FILE, JSON.stringify(keyData, null, 2), { mode: 0o600 });
   return keyData;
 }
@@ -36,28 +36,24 @@ function saveKey(keyData) {
   fs.writeFileSync(KEY_FILE, JSON.stringify(keyData, null, 2), { mode: 0o600 });
 }
 
-// ── HTTP ─────────────────────────────────────────────────────────────────────
+// ── HTTP — signed with Ed25519, no bearer token ───────────────────────────────
 
-function buildHeaders(keyData) {
+function ascHeaders(keyData) {
   const ts  = String(Math.floor(Date.now() / 1000));
-  const sig = crypto.sign(
-    null,
-    Buffer.from(`${ts}:${keyData.tokenId}`),
-    crypto.createPrivateKey(keyData.privateKey)
-  ).toString('base64');
+  const msg = Buffer.from(`${ts}:${keyData.fingerprint}`);
+  const sig = crypto.sign(null, msg, crypto.createPrivateKey(keyData.privateKey)).toString('base64');
   return {
-    'Authorization':     `Bearer ${BEARER}`,
-    'X-Agent-PublicKey': keyData.publicKey,
-    'X-Agent-Signature': sig,
-    'X-Agent-Timestamp': ts,
-    'Content-Type':      'application/json',
+    'X-Agent-PublicKey':  keyData.publicKey,
+    'X-Agent-Signature':  sig,
+    'X-Agent-Timestamp':  ts,
+    'Content-Type':       'application/json',
   };
 }
 
-async function api(method, endpoint, body, signed = false, keyData = null) {
-  const headers = signed && keyData?.tokenId
-    ? buildHeaders(keyData)
-    : { 'Authorization': `Bearer ${BEARER}`, 'Content-Type': 'application/json' };
+async function api(method, endpoint, body, keyData) {
+  const headers = keyData
+    ? ascHeaders(keyData)
+    : { 'Content-Type': 'application/json' };
   const res  = await fetch(`${BASE_URL}/api/v1${endpoint}`, {
     method, headers, body: body ? JSON.stringify(body) : undefined,
   });
@@ -69,60 +65,17 @@ function text(str) {
   return { content: [{ type: 'text', text: String(str) }] };
 }
 
-// ── Setup ─────────────────────────────────────────────────────────────────────
-// Returns { ready: true, keyData } or { ready: false, message }
+// ── Status check ──────────────────────────────────────────────────────────────
 
-async function ensureReady() {
-  if (!BEARER) return {
-    ready: false,
-    message: '⚠️  MYAPI_TOKEN is not set.\n\nAdd it to your MCP config:\n  "env": { "MYAPI_TOKEN": "myapi_..." }\n\nGet your token at: ' + BASE_URL + '/dashboard/access-tokens',
-  };
-
-  let keyData = loadKey() || generateAndSaveKey();
-
-  // Fetch tokenId if missing
-  if (!keyData.tokenId) {
-    const r = await api('GET', '/agentic/asc/token-id');
-    if (!r.ok) return { ready: false, message: `⚠️  Cannot reach MyApi (HTTP ${r.status}). Check MYAPI_TOKEN and MYAPI_BASE_URL.` };
-    keyData.tokenId = r.data.tokenId;
-    saveKey(keyData);
-  }
-
-  // Already approved — fast path
-  if (keyData.approved) return { ready: true, keyData };
-
-  // Probe with a signed request
-  const probe = await api('GET', '/identity', null, true, keyData);
-  if (probe.ok) {
-    keyData.approved = true;
-    saveKey(keyData);
-    return { ready: true, keyData };
-  }
-
-  // 403 → pending — register so it shows with a label in Devices
-  if (probe.status === 403) {
-    await api('POST', '/agentic/asc/register', { public_key: keyData.publicKey, label: LABEL });
-    const fp = (await api('POST', '/agentic/asc/register', { public_key: keyData.publicKey, label: LABEL })).data?.key_fingerprint || '(see Devices page)';
-    return {
-      ready: false,
-      message: [
-        '⏳ One-time approval needed.',
-        '',
-        `I've registered my public key with MyApi.`,
-        `Fingerprint: ${fp}`,
-        '',
-        `Please open: ${BASE_URL}/dashboard/devices`,
-        `and click Approve on the entry called "${LABEL}".`,
-        '',
-        `Then call myapi_status again — I'll confirm automatically.`,
-      ].join('\n'),
-    };
-  }
-
-  return { ready: false, message: `⚠️  Unexpected response (HTTP ${probe.status}). Check your token.` };
+async function checkStatus(keyData) {
+  const probe = await api('GET', '/identity', null, keyData);
+  if (probe.ok) return { approved: true };
+  if (probe.status === 401) return { approved: false, reason: 'not_registered' };
+  if (probe.status === 403) return { approved: false, reason: 'pending' };
+  return { approved: false, reason: `error_${probe.status}` };
 }
 
-// ── MCP server ───────────────────────────────────────────────────────────────
+// ── MCP server ────────────────────────────────────────────────────────────────
 
 const server = new Server(
   { name: 'myapi-asc-mcp', version: '1.0.0' },
@@ -136,14 +89,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: [
         'Check the MyApi ASC connection status.',
         'ALWAYS call this first before any other myapi_* tool.',
-        'On first run it generates a keypair, registers it with MyApi, and asks the user to approve it in the Devices dashboard (one-time, takes ~10 seconds).',
-        'Once approved, all requests are signed automatically and this returns a confirmation.',
+        'On first run it generates an Ed25519 keypair and outputs the public key for the user to register in the MyApi dashboard.',
+        'Once the user has registered and approved the key, this confirms the connection is active.',
       ].join(' '),
       inputSchema: { type: 'object', properties: {} },
     },
     {
       name: 'myapi_identity',
-      description: "Fetch the user's MyApi identity: display name, email, and active personas. Use this to verify the connection is working or to understand who the user is.",
+      description: "Fetch the user's MyApi identity (name, email, active personas). Use this to confirm the connection is working.",
       inputSchema: { type: 'object', properties: {} },
     },
   ],
@@ -153,22 +106,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name } = request.params;
 
   if (name === 'myapi_status') {
-    const result = await ensureReady();
-    if (!result.ready) return text(result.message);
-    const { keyData } = result;
+    let keyData = loadKey() || generateAndSaveKey();
+
+    if (!keyData.approved) {
+      const { approved, reason } = await checkStatus(keyData);
+      if (approved) {
+        keyData.approved = true;
+        saveKey(keyData);
+      } else if (reason === 'not_registered') {
+        return text([
+          '🔑 First-time setup — register this public key with the user.',
+          '',
+          `Public key (Ed25519):`,
+          keyData.publicKey,
+          '',
+          `Key file: ${KEY_FILE}`,
+          '',
+          'Ask the user to:',
+          `  1. Go to ${BASE_URL}/dashboard/connectors → Agent Connections → ASC Keypair`,
+          '  2. Paste the public key above into the registration form',
+          '  3. Click "Register public key"',
+          '  4. Approve the pending entry in the Devices page',
+          '',
+          'Then call myapi_status again — I will confirm automatically.',
+        ].join('\n'));
+      } else if (reason === 'pending') {
+        return text([
+          '⏳ Key registered — waiting for approval.',
+          '',
+          `Ask the user to open ${BASE_URL}/dashboard/devices and click Approve.`,
+          'Then call myapi_status again.',
+        ].join('\n'));
+      } else {
+        return text(`⚠️  Unexpected response from MyApi (${reason}). Check MYAPI_BASE_URL or try again.`);
+      }
+    }
+
     return text([
       '✓ MyApi ASC connection active.',
-      `  Signing key: ${keyData.publicKey.slice(0, 16)}…`,
-      `  Key file:    ${KEY_FILE}`,
+      `  Key fingerprint: ${keyData.fingerprint}`,
+      `  Key file:        ${KEY_FILE}`,
       '',
-      'You can now call myapi_identity or any other myapi_* tool.',
+      'All requests are signed cryptographically. You can now call myapi_identity or any other myapi_* tool.',
     ].join('\n'));
   }
 
   if (name === 'myapi_identity') {
-    const result = await ensureReady();
-    if (!result.ready) return text(`Not connected. Call myapi_status first.\n\n${result.message}`);
-    const res = await api('GET', '/identity', null, true, result.keyData);
+    let keyData = loadKey();
+    if (!keyData?.approved) {
+      return text('Not connected. Call myapi_status first to complete setup.');
+    }
+    const res = await api('GET', '/identity', null, keyData);
     if (!res.ok) return text(`Error ${res.status}: ${JSON.stringify(res.data)}`);
     return text(JSON.stringify(res.data, null, 2));
   }
